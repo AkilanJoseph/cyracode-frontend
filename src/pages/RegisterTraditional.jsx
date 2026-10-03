@@ -1,0 +1,647 @@
+import { useState, useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
+import toast from 'react-hot-toast'
+import { Check, X, Loader2, AlertTriangle } from 'lucide-react'
+import Country from 'country-state-city/lib/country'
+import { useTranslation } from 'react-i18next'
+import ProgressSteps from '../components/common/ProgressSteps'
+import Button from '../components/common/Button'
+import Input from '../components/common/Input'
+import ConfirmDialog from '../components/common/ConfirmDialog'
+import MapPicker from '../components/MapPicker'
+import Header from '../components/common/Header'
+import Footer from '../components/common/Footer'
+import { APP_MAX_WIDTH, APP_PADDING_Y } from '../lib/layout'
+import { registration } from '../services/api'
+import { apiErrorMessage } from '../utils/errors'
+import { useGoBack } from '../utils/navigation'
+
+// Haversine distance in meters (client-side, for AC 2.17 warning)
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLng = ((lng2 - lng1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+const POSTAL_REGEX = {
+  IN: /^\d{6}$/,
+  US: /^\d{5}(-\d{4})?$/,
+  GB: /^[A-Za-z]{1,2}\d[A-Za-z\d]?\s*\d[A-Za-z]{2}$/,
+  JP: /^\d{3}-?\d{4}$/,
+}
+
+export function SelectWithLoader({ loading, className, children, ...rest }) {
+  return (
+    <div className="relative">
+      <select {...rest} className={className}>{children}</select>
+      {loading && (
+        <Loader2
+          className="w-4 h-4 animate-spin text-primary absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+          aria-hidden="true"
+        />
+      )}
+    </div>
+  )
+}
+
+export function AddressStep({ address, setAddress, errors, clearError }) {
+  const { t } = useTranslation()
+  const [postalError, setPostalError] = useState('')
+
+  // AC 2.8: Full 195+ country list (ISO 3166-1); priority countries surfaced at top
+  const allCountries = Country.getAllCountries()
+  const SPECIAL_CODES = ['IN', 'US', 'GB', 'JP']
+  const priorityCountries = SPECIAL_CODES.map((code) => allCountries.find((c) => c.isoCode === code)).filter(Boolean)
+  const remainingCountries = allCountries.filter((c) => !SPECIAL_CODES.includes(c.isoCode))
+
+  const set = (field, value) => {
+    setAddress({ ...address, [field]: value })
+    if (typeof clearError === 'function') clearError(field)
+  }
+
+  // AC 2.12: State/province dropdown — state dataset is lazy-loaded only when a
+  // country is chosen so it is split into an on-demand chunk.
+  const [states, setStates] = useState([])
+  const [loadingStates, setLoadingStates] = useState(false)
+  useEffect(() => {
+    let active = true
+    if (!address.country_code) {
+      setStates([])
+      setLoadingStates(false)
+      return undefined
+    }
+    setLoadingStates(true)
+    import('country-state-city/lib/state')
+      .then((mod) => {
+        if (active) setStates(mod.default.getStatesOfCountry(address.country_code))
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setLoadingStates(false)
+      })
+    return () => { active = false }
+  }, [address.country_code])
+
+  // AC 2.9: District dropdown (India) — city dataset is ~7 MB, so lazy-load it
+  // only when a state is selected; Vite splits it into an on-demand chunk.
+  const [districts, setDistricts] = useState([])
+  const [loadingDistricts, setLoadingDistricts] = useState(false)
+  useEffect(() => {
+    let active = true
+    if (!address.country_code || !address.stateIso) {
+      setDistricts([])
+      setLoadingDistricts(false)
+      return undefined
+    }
+    setLoadingDistricts(true)
+    import('country-state-city/lib/city')
+      .then((mod) => {
+        if (active) {
+          setDistricts(mod.default.getCitiesOfState(address.country_code, address.stateIso))
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setLoadingDistricts(false)
+      })
+    return () => { active = false }
+  }, [address.country_code, address.stateIso])
+
+  // Preload both datasets when the form mounts so selecting a country then a
+  // state populates the district dropdown immediately (module is cached by the
+  // bundler, so later import() calls resolve instantly).
+  useEffect(() => {
+    import('country-state-city/lib/state').catch(() => {})
+    import('country-state-city/lib/city').catch(() => {})
+  }, [])
+
+  // AC 2.13: Real-time postal code validation
+  const validatePostal = (code, countryCode) => {
+    const rx = POSTAL_REGEX[countryCode]
+    if (!rx || !code) return ''
+    return rx.test(code.trim()) ? '' : 'Invalid postal code format for the selected country'
+  }
+
+  const handlePostalChange = (val) => {
+    set('postal_code', val)
+    setPostalError(validatePostal(val, address.country_code))
+  }
+
+  const handleCountryChange = (code) => {
+    const c = allCountries.find((x) => x.isoCode === code)
+    setAddress({ ...address, country_code: code, country: c?.name || '', state: '', stateIso: '', district: '' })
+    setPostalError('')
+    if (typeof clearError === 'function') {
+      clearError('country_code')
+      clearError('state')
+      clearError('district')
+      clearError('city')
+    }
+  }
+
+  const postalErr = postalError || errors.postal_code
+  const isGenericCountry = address.country_code && !SPECIAL_CODES.includes(address.country_code)
+  const selectCls = 'w-full px-3.5 py-2.5 text-sm border border-border rounded-xl outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary bg-white text-ink'
+
+  return (
+    <div className="space-y-4">
+      {/* AC 2.8: 195+ ISO 3166-1 countries with common countries pinned at top */}
+      <div>
+        <label className="block text-xs font-semibold text-muted uppercase tracking-wide mb-1.5">{t('register.country')}</label>
+        <select
+          value={address.country_code}
+          onChange={(e) => handleCountryChange(e.target.value)}
+          className={selectCls}
+        >
+          <option value="">{t('register.select_country')}</option>
+          <optgroup label="Common Countries">
+            {priorityCountries.map((c) => <option key={c.isoCode} value={c.isoCode}>{c.name}</option>)}
+          </optgroup>
+          <optgroup label="All Countries">
+            {remainingCountries.map((c) => <option key={c.isoCode} value={c.isoCode}>{c.name}</option>)}
+          </optgroup>
+        </select>
+        {errors.country_code && <p className="mt-1 text-sm text-red-500">{errors.country_code}</p>}
+      </div>
+
+      {/* AC 2.9: India — cascading State → District dropdowns */}
+      {address.country_code === 'IN' && (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-muted uppercase tracking-wide mb-1.5">{t('register.state')}</label>
+              <SelectWithLoader loading={loadingStates} value={address.stateIso || ''} onChange={(e) => { const s = states.find((x) => x.isoCode === e.target.value); setAddress({ ...address, stateIso: e.target.value, state: s?.name || '', district: '' }); if (typeof clearError === 'function') { clearError('state'); clearError('district') } }} className={selectCls}>
+                <option value="">{t('register.select_state')}</option>
+                {states.map((s) => <option key={s.isoCode} value={s.isoCode}>{s.name}</option>)}
+              </SelectWithLoader>
+              {errors.state && <p className="mt-1 text-sm text-red-500">{errors.state}</p>}
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-muted uppercase tracking-wide mb-1.5">{t('register.district')}</label>
+              <SelectWithLoader loading={loadingDistricts} value={address.district || ''} onChange={(e) => set('district', e.target.value)} className={selectCls}>
+                <option value="">{t('register.select_district')}</option>
+                {districts.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
+              </SelectWithLoader>
+              {errors.district && <p className="mt-1 text-sm text-red-500">{errors.district}</p>}
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.area')} value={address.area} onChange={(e) => set('area', e.target.value)} error={errors.area} maxLength={100} />
+            <Input label={t('register.town')} value={address.town} onChange={(e) => set('town', e.target.value)} error={errors.town} maxLength={100} />
+          </div>
+          <Input label={t('register.city')} value={address.city || ''} onChange={(e) => set('city', e.target.value)} error={errors.city} maxLength={100} />
+          <Input label={t('register.road_name')} value={address.road_name} onChange={(e) => set('road_name', e.target.value)} error={errors.road_name} maxLength={100} />
+          <Input label={t('register.avenue_name')} value={address.avenue_name} onChange={(e) => set('avenue_name', e.target.value)} error={errors.avenue_name} maxLength={100} />
+          <Input label={t('register.street')} value={address.street_address} onChange={(e) => set('street_address', e.target.value)} error={errors.street_address} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.building')} value={address.building_name} onChange={(e) => set('building_name', e.target.value)} error={errors.building_name} maxLength={100} />
+            <Input label={t('register.floor')} value={address.floor_unit} onChange={(e) => set('floor_unit', e.target.value)} error={errors.floor_unit} maxLength={50} />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.flat_number')} value={address.flat_number} onChange={(e) => set('flat_number', e.target.value)} error={errors.flat_number} maxLength={50} />
+            <Input label={t('register.plot_number')} value={address.plot_number} onChange={(e) => set('plot_number', e.target.value)} error={errors.plot_number} maxLength={50} />
+          </div>
+          <Input label={t('register.suite_name')} value={address.suite_name} onChange={(e) => set('suite_name', e.target.value)} error={errors.suite_name} maxLength={50} />
+          {/* AC 2.14: Landmark optional, max 100 chars */}
+          <Input label={t('register.landmark')} value={address.landmark || ''} onChange={(e) => set('landmark', e.target.value)} maxLength={100} />
+          {/* AC 2.13: Real-time postal validation */}
+          <Input label={t('register.postal_in')} value={address.postal_code} onChange={(e) => handlePostalChange(e.target.value)} error={postalErr} helperText={!postalErr ? t('register.postal_hint_in') : undefined} />
+          <Input label={t('register.po_box')} value={address.po_box || ''} onChange={(e) => set('po_box', e.target.value)} error={errors.po_box} maxLength={10} />
+        </>
+      )}
+
+      {/* AC 2.10: USA */}
+      {address.country_code === 'US' && (
+        <>
+          <Input label={t('register.street')} value={address.street_address} onChange={(e) => set('street_address', e.target.value)} error={errors.street_address} maxLength={100} />
+          <Input label={t('register.road_name')} value={address.road_name} onChange={(e) => set('road_name', e.target.value)} error={errors.road_name} maxLength={100} />
+          <Input label={t('register.avenue_name')} value={address.avenue_name} onChange={(e) => set('avenue_name', e.target.value)} error={errors.avenue_name} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.flat_number')} value={address.flat_number} onChange={(e) => set('flat_number', e.target.value)} error={errors.flat_number} maxLength={50} />
+            <Input label={t('register.plot_number')} value={address.plot_number} onChange={(e) => set('plot_number', e.target.value)} error={errors.plot_number} maxLength={50} />
+          </div>
+          <Input label={t('register.suite_name')} value={address.suite_name} onChange={(e) => set('suite_name', e.target.value)} error={errors.suite_name} maxLength={50} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.area')} value={address.area} onChange={(e) => set('area', e.target.value)} error={errors.area} maxLength={100} />
+            <Input label={t('register.town')} value={address.town} onChange={(e) => set('town', e.target.value)} error={errors.town} maxLength={100} />
+          </div>
+          <Input label={t('register.city')} value={address.city || ''} onChange={(e) => set('city', e.target.value)} error={errors.city} maxLength={100} />
+          <div>
+            <label className="block text-xs font-semibold text-muted uppercase tracking-wide mb-1.5">{t('register.state')}</label>
+            <SelectWithLoader loading={loadingStates} value={address.stateIso || ''} onChange={(e) => { const s = states.find((x) => x.isoCode === e.target.value); setAddress({ ...address, stateIso: e.target.value, state: s?.name || '' }); if (typeof clearError === 'function') clearError('state') }} className={selectCls}>
+              <option value="">{t('register.select_state')}</option>
+              {states.map((s) => <option key={s.isoCode} value={s.isoCode}>{s.name}</option>)}
+            </SelectWithLoader>
+            {errors.state && <p className="mt-1 text-sm text-red-500">{errors.state}</p>}
+          </div>
+          <Input label={t('register.landmark')} value={address.landmark || ''} onChange={(e) => set('landmark', e.target.value)} maxLength={100} />
+          <Input label={t('register.postal_us')} value={address.postal_code} onChange={(e) => handlePostalChange(e.target.value)} error={postalErr} helperText={!postalErr ? t('register.postal_hint_us') : undefined} />
+        </>
+      )}
+
+      {/* AC 2.11: UK — Flat/Plot added (AC 2.15), Landmark added (AC 2.14) */}
+      {address.country_code === 'GB' && (
+        <>
+          <Input label={t('register.building_num')} value={address.building_name} onChange={(e) => set('building_name', e.target.value)} error={errors.building_name} maxLength={100} />
+          <Input label={t('register.street')} value={address.street_address} onChange={(e) => set('street_address', e.target.value)} error={errors.street_address} maxLength={100} />
+          <Input label={t('register.road_name')} value={address.road_name} onChange={(e) => set('road_name', e.target.value)} error={errors.road_name} maxLength={100} />
+          <Input label={t('register.avenue_name')} value={address.avenue_name} onChange={(e) => set('avenue_name', e.target.value)} error={errors.avenue_name} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.area')} value={address.area} onChange={(e) => set('area', e.target.value)} error={errors.area} maxLength={100} />
+            <Input label={t('register.town')} value={address.town} onChange={(e) => set('town', e.target.value)} error={errors.town} maxLength={100} />
+          </div>
+          <Input label={t('register.city')} value={address.city || ''} onChange={(e) => set('city', e.target.value)} error={errors.city} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.flat_number')} value={address.flat_number} onChange={(e) => set('flat_number', e.target.value)} error={errors.flat_number} maxLength={50} />
+            <Input label={t('register.plot_number')} value={address.plot_number} onChange={(e) => set('plot_number', e.target.value)} error={errors.plot_number} maxLength={50} />
+          </div>
+          <Input label={t('register.suite_name')} value={address.suite_name} onChange={(e) => set('suite_name', e.target.value)} error={errors.suite_name} maxLength={50} />
+          <Input label={t('register.floor')} value={address.floor_unit} onChange={(e) => set('floor_unit', e.target.value)} error={errors.floor_unit} maxLength={50} />
+          <Input label={t('register.landmark')} value={address.landmark || ''} onChange={(e) => set('landmark', e.target.value)} maxLength={100} />
+          <Input label={t('register.postal_gb')} value={address.postal_code} onChange={(e) => handlePostalChange(e.target.value)} error={postalErr} />
+        </>
+      )}
+
+      {/* Japan — Landmark added (AC 2.14) */}
+      {address.country_code === 'JP' && (
+        <>
+          <Input label={t('register.postal_jp')} value={address.postal_code} onChange={(e) => handlePostalChange(e.target.value)} error={postalErr} helperText={!postalErr ? t('register.postal_hint_jp') : undefined} />
+          <Input label={t('register.prefecture')} value={address.state} onChange={(e) => set('state', e.target.value)} error={errors.state} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.area')} value={address.area} onChange={(e) => set('area', e.target.value)} error={errors.area} maxLength={100} />
+            <Input label={t('register.town')} value={address.town} onChange={(e) => set('town', e.target.value)} error={errors.town} maxLength={100} />
+          </div>
+          <Input label={t('register.city')} value={address.city || ''} onChange={(e) => set('city', e.target.value)} error={errors.city} maxLength={100} />
+          <Input label={t('register.road_name')} value={address.road_name} onChange={(e) => set('road_name', e.target.value)} error={errors.road_name} maxLength={100} />
+          <Input label={t('register.avenue_name')} value={address.avenue_name} onChange={(e) => set('avenue_name', e.target.value)} error={errors.avenue_name} maxLength={100} />
+          <Input label={t('register.district_ward')} value={address.district} onChange={(e) => set('district', e.target.value)} maxLength={100} />
+          <Input label={t('register.building')} value={address.building_name} onChange={(e) => set('building_name', e.target.value)} error={errors.building_name} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.flat_number')} value={address.flat_number} onChange={(e) => set('flat_number', e.target.value)} error={errors.flat_number} maxLength={50} />
+            <Input label={t('register.plot_number')} value={address.plot_number} onChange={(e) => set('plot_number', e.target.value)} error={errors.plot_number} maxLength={50} />
+          </div>
+          <Input label={t('register.suite_name')} value={address.suite_name} onChange={(e) => set('suite_name', e.target.value)} error={errors.suite_name} maxLength={50} />
+          <Input label={t('register.street_block')} value={address.street_address} onChange={(e) => set('street_address', e.target.value)} error={errors.street_address} maxLength={100} />
+          <Input label={t('register.landmark')} value={address.landmark || ''} onChange={(e) => set('landmark', e.target.value)} maxLength={100} />
+        </>
+      )}
+
+      {/* AC 2.12: All other countries — state dropdown + full fields (AC 2.14, 2.15) */}
+      {isGenericCountry && (
+        <>
+          <Input label={t('register.street')} value={address.street_address} onChange={(e) => set('street_address', e.target.value)} error={errors.street_address} maxLength={100} />
+          <Input label={t('register.road_name')} value={address.road_name} onChange={(e) => set('road_name', e.target.value)} error={errors.road_name} maxLength={100} />
+          <Input label={t('register.avenue_name')} value={address.avenue_name} onChange={(e) => set('avenue_name', e.target.value)} error={errors.avenue_name} maxLength={100} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.area')} value={address.area} onChange={(e) => set('area', e.target.value)} error={errors.area} maxLength={100} />
+            <Input label={t('register.town')} value={address.town} onChange={(e) => set('town', e.target.value)} error={errors.town} maxLength={100} />
+          </div>
+          <Input label={t('register.city')} value={address.city || ''} onChange={(e) => set('city', e.target.value)} error={errors.city} maxLength={100} />
+          {states.length > 0 ? (
+            <div>
+              <label className="block text-xs font-semibold text-muted uppercase tracking-wide mb-1.5">{t('register.state_province')}</label>
+              <SelectWithLoader loading={loadingStates} value={address.stateIso || ''} onChange={(e) => { const s = states.find((x) => x.isoCode === e.target.value); setAddress({ ...address, stateIso: e.target.value, state: s?.name || '' }); if (typeof clearError === 'function') clearError('state') }} className={selectCls}>
+                <option value="">{t('register.select_state')}</option>
+                {states.map((s) => <option key={s.isoCode} value={s.isoCode}>{s.name}</option>)}
+              </SelectWithLoader>
+              {errors.state && <p className="mt-1 text-sm text-red-500">{errors.state}</p>}
+            </div>
+          ) : (
+            <Input label={t('register.state_province')} value={address.state} onChange={(e) => set('state', e.target.value)} error={errors.state} maxLength={100} />
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Input label={t('register.building')} value={address.building_name} onChange={(e) => set('building_name', e.target.value)} error={errors.building_name} maxLength={100} />
+            <Input label={t('register.flat_number')} value={address.flat_number} onChange={(e) => set('flat_number', e.target.value)} error={errors.flat_number} maxLength={50} />
+          </div>
+          <Input label={t('register.plot_number')} value={address.plot_number} onChange={(e) => set('plot_number', e.target.value)} error={errors.plot_number} maxLength={50} />
+          <Input label={t('register.suite_name')} value={address.suite_name} onChange={(e) => set('suite_name', e.target.value)} error={errors.suite_name} maxLength={50} />
+          <Input label={t('register.landmark')} value={address.landmark || ''} onChange={(e) => set('landmark', e.target.value)} error={errors.landmark} maxLength={100} />
+          <Input label={t('register.postal_other')} value={address.postal_code} onChange={(e) => handlePostalChange(e.target.value)} error={postalErr} maxLength={20} />
+        </>
+      )}
+    </div>
+  )
+}
+
+export function validateAddress(address) {
+  const errors = {}
+  // AC 2.16: "This field is required" for all mandatory fields
+  if (!address.country_code) errors.country_code = 'This field is required'
+  if (!address.street_address?.trim()) errors.street_address = 'This field is required'
+  else if (address.street_address.length > 100) errors.street_address = 'Must not exceed 100 characters'
+  // State/province: required wherever the form offers the field (not UK)
+  if (address.country_code && address.country_code !== 'GB' && !address.state?.trim()) {
+    errors.state = 'This field is required'
+  } else if (address.state?.length > 100) {
+    errors.state = 'Must not exceed 100 characters'
+  }
+  // City: required for every country layout
+  if (address.country_code && !address.city?.trim()) errors.city = 'This field is required'
+  else if (address.city?.length > 100) errors.city = 'Must not exceed 100 characters'
+  // District (India dropdown) / district-ward (Japan text): required where present
+  if (address.country_code === 'IN' && !address.district?.trim()) errors.district = 'This field is required'
+  else if (address.country_code === 'JP' && !address.district?.trim()) errors.district = 'This field is required'
+  else if (address.district?.length > 100) errors.district = 'Must not exceed 100 characters'
+  // AC 6.22: optional field length limits
+  if (address.area?.length > 100) errors.area = 'Must not exceed 100 characters'
+  if (address.town?.length > 100) errors.town = 'Must not exceed 100 characters'
+  if (address.road_name?.length > 100) errors.road_name = 'Must not exceed 100 characters'
+  if (address.avenue_name?.length > 100) errors.avenue_name = 'Must not exceed 100 characters'
+  if (address.building_name?.length > 100) errors.building_name = 'Must not exceed 100 characters'
+  if (address.flat_number?.length > 50) errors.flat_number = 'Must not exceed 50 characters'
+  if (address.suite_name?.length > 50) errors.suite_name = 'Must not exceed 50 characters'
+  if (address.plot_number?.length > 50) errors.plot_number = 'Must not exceed 50 characters'
+  if (address.floor_unit?.length > 50) errors.floor_unit = 'Must not exceed 50 characters'
+  if (address.landmark?.length > 100) errors.landmark = 'Must not exceed 100 characters'
+  if (address.po_box?.length > 10) errors.po_box = 'Must not exceed 10 characters'
+  if (!address.postal_code?.trim()) {
+    errors.postal_code = 'This field is required'
+  } else {
+    const rx = POSTAL_REGEX[address.country_code]
+    if (rx && !rx.test(address.postal_code.trim())) {
+      errors.postal_code = 'Invalid postal code format for the selected country'
+    }
+  }
+  return errors
+}
+
+export default function RegisterTraditional() {
+  const navigate = useNavigate()
+  const { t } = useTranslation()
+  const [step, setStep] = useState(1)
+  const [submitting, setSubmitting] = useState(false)
+  // AC 6.17: generate once per form session; same key used on any rapid re-submit
+  const idempotencyKeyRef = useRef(
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `key-${Date.now()}-${Math.random()}`
+  )
+
+  const [coords, setCoords] = useState(null)
+  const [mapGeoCountry, setMapGeoCountry] = useState(null) // country from reverse geocode
+  const [name, setName] = useState('')
+  const [nameStatus, setNameStatus] = useState(null)
+  const [nameFormatError, setNameFormatError] = useState('')
+  const [suggestions, setSuggestions] = useState([])
+  const debounceRef = useRef(null)
+
+  const [address, setAddress] = useState({
+    country_code: '', country: '', state: '', stateIso: '', district: '',
+    city: '', area: '', town: '', road_name: '', avenue_name: '', street_address: '', building_name: '', flat_number: '', suite_name: '', plot_number: '',
+    floor_unit: '', postal_code: '', po_box: '', landmark: '',
+  })
+  const [addressErrors, setAddressErrors] = useState({})
+
+  const clearFieldError = (field) =>
+    setAddressErrors((prev) => {
+      if (!(field in prev)) return prev
+      const next = { ...prev }
+      delete next[field]
+      return next
+    })
+  const [showMismatch, setShowMismatch] = useState(false)
+
+  const STEPS = [t('register.step_location_name'), t('register.step_address')]
+
+  useEffect(() => {
+    if (!name || name.length < 3) { setNameStatus(null); setSuggestions([]); return }
+    setNameStatus('checking')
+    clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const { data } = await registration.checkName(name)
+        setNameStatus(data.available ? 'available' : 'taken')
+        setSuggestions(data.suggestions || [])
+      } catch { setNameStatus(null) }
+    }, 500)
+    return () => clearTimeout(debounceRef.current)
+  }, [name])
+
+  // AC 2.17: Check mismatch when user changes country in step 2
+  useEffect(() => {
+    if (!mapGeoCountry || !address.country_code || address.country_code === 'OTHER') {
+      setShowMismatch(false)
+      return
+    }
+    setShowMismatch(address.country_code !== mapGeoCountry)
+  }, [address.country_code, mapGeoCountry])
+
+  const handleLocationSelect = (lat, lng, addr, raw) => {
+    // Always accept the picked coordinate so lat/lng are prefilled.
+    setCoords({ lat, lng })
+
+    // AC 2.x / OSM (Nominatim) reverse geocoding:
+    // `raw` is the Nominatim JSON payload (or null if geocoding failed).
+    // A residential address requires a country component; ocean/international
+    // waters have no `address.country`. If raw is null (geocode failure) or it
+    // has no country, we still keep the coordinates but warn softly.
+    const countryCode = raw?.address?.country_code
+    if (countryCode) {
+      setMapGeoCountry(countryCode.toUpperCase())
+    } else {
+      setMapGeoCountry(null)
+    }
+
+    if (raw && !raw.address?.country) {
+      toast.error('Please select a valid residential address')
+      return
+    }
+    if (addr) toast.success('Location selected')
+  }
+
+  // Return to whichever screen the user started from, so an abandoned
+  // registration drops them where they expected to be rather than on a
+  // hard-coded page. Nothing is persisted until submit, but anything already
+  // typed would be silently lost, so ask first when there is work to throw away.
+  const goBackToOrigin = useGoBack('/dashboard')
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false)
+
+  const hasInvestedEffort =
+    name.trim().length > 0 || Boolean(coords) || Object.values(address).some((v) => v && v !== 'OTHER')
+
+  const cancelRegistration = () => {
+    if (hasInvestedEffort) setConfirmingDiscard(true)
+    else goBackToOrigin()
+  }
+
+  const nextFromStep1 = () => {
+    if (!coords) return toast.error(t('errors.select_location'))
+    if (name.length < 3) return toast.error(t('errors.name_short'))
+    if (nameStatus !== 'available') return toast.error(t('errors.name_unavailable'))
+    setStep(2)
+  }
+
+  const nextFromStep2 = () => {
+    const errors = validateAddress(address)
+    setAddressErrors(errors)
+    if (Object.keys(errors).length) return toast.error(t('errors.fix_fields'))
+    submit()
+  }
+
+  const submit = async () => {
+    setSubmitting(true)
+    try {
+      const payload = {
+        name,
+        latitude: coords.lat,
+        longitude: coords.lng,
+        country: address.country,
+        country_code: address.country_code === 'OTHER' ? 'XX' : address.country_code,
+        state: address.state || null,
+        district: address.district || null,
+        city: address.city || null,
+        area: address.area || null,
+        town: address.town || null,
+        road_name: address.road_name || null,
+        avenue_name: address.avenue_name || null,
+        street_address: address.street_address,
+        building_name: address.building_name || null,
+        flat_number: address.flat_number || null,
+        suite_name: address.suite_name || null,
+        plot_number: address.plot_number || null,
+        floor_unit: address.floor_unit || null,
+        postal_code: address.postal_code,
+        po_box: address.po_box || null,
+        landmark: address.landmark || null,
+      }
+      const { data } = await registration.registerTraditional(payload, idempotencyKeyRef.current)
+      navigate('/confirmation', { state: { record: data, mode: 'traditional' } })
+    } catch (err) {
+      toast.error(apiErrorMessage(err, t('errors.register_failed')))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-surface">
+      <Header showBack breadcrumb={t('nav.register')} maxWidth={APP_MAX_WIDTH} />
+
+      <div id="main-content" className={`${APP_MAX_WIDTH} mx-auto px-4 ${APP_PADDING_Y}`}>
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-ink">{t('register.title_traditional')}</h1>
+          <p className="text-muted mt-1">{t('common.step_of', { current: step, total: 2, name: STEPS[step - 1] })}</p>
+        </div>
+        <ProgressSteps steps={STEPS} current={step} />
+
+        <div className="bg-white rounded-3xl border border-border shadow-card p-6 sm:p-8 mt-6">
+          {step === 1 && (
+            <div className="space-y-5">
+              {/* The name is chosen first so the availability check and its
+                  suggestions are read before the user works the map. */}
+              <div>
+                <Input
+                  label={t('register.name_label')}
+                  placeholder={t('register.name_placeholder')}
+                  value={name}
+                  onChange={(e) => {
+                    const v = e.target.value
+                    if (v.length > 50) {
+                      setNameFormatError('Max 50 characters allowed.')
+                      return
+                    }
+                    // International Character Support: allow Unicode letters/digits + spaces
+                    if (v && !/^[\p{L}\p{N} ]*$/u.test(v)) {
+                      setNameFormatError('Name must contain only letters, numbers, and spaces. Unicode characters (Hindi, Arabic, Chinese, etc.) are supported.')
+                      return
+                    }
+                    setNameFormatError('')
+                    setName(v)
+                  }}
+                  helperText={!nameFormatError ? t('register.name_helper') : undefined}
+                  error={nameFormatError || undefined}
+                  rightIcon={
+                    !nameFormatError && nameStatus === 'checking' ? <Loader2 className="w-4 h-4 animate-spin text-gray-400" /> :
+                    !nameFormatError && nameStatus === 'available' ? <Check className="w-4 h-4 text-green-500" /> :
+                    !nameFormatError && nameStatus === 'taken' ? <X className="w-4 h-4 text-red-500" /> : null
+                  }
+                />
+                {nameStatus === 'available' && (
+                  <p className="mt-1.5 text-xs text-emerald-600 font-medium">{t('register.name_available')}</p>
+                )}
+                {nameStatus === 'taken' && (
+                  <div className="mt-2">
+                    <p className="text-xs text-red-500 font-medium mb-1.5">{t('register.name_taken')}</p>
+                    <div className="flex flex-wrap gap-2">
+                      {suggestions.map((s) => (
+                        <button key={s} onClick={() => setName(s)} className="text-xs px-3 py-1.5 rounded-full bg-primary-light text-primary hover:bg-teal-100 font-medium transition-colors">
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <MapPicker markerPosition={coords} onLocationSelect={handleLocationSelect} />
+              {/* AC 2.5 & 2.6: Read-only coordinate fields auto-populated from map */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-4">
+                <Input
+                  label="Latitude"
+                  value={coords ? coords.lat.toFixed(6) : ''}
+                  placeholder="Select location on map"
+                  disabled
+                  helperText="Auto-filled from map"
+                />
+                <Input
+                  label="Longitude"
+                  value={coords ? coords.lng.toFixed(6) : ''}
+                  placeholder="Select location on map"
+                  disabled
+                  helperText="Auto-filled from map"
+                />
+              </div>
+              {/* AC 2.7: Disabled with tooltip until location selected */}
+              <div className="flex gap-3">
+                <Button variant="secondary" onClick={cancelRegistration} className="flex-1">
+                  {t('common.cancel')}
+                </Button>
+                <Button
+                  onClick={nextFromStep1}
+                  disabled={!coords}
+                  title={!coords ? 'Please select a location on the map first' : undefined}
+                  className="flex-1"
+                >
+                  {t('common.continue')}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {step === 2 && (
+            <div className="space-y-5">
+              {showMismatch && (
+                <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl p-3 text-sm text-amber-700">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span>{t('register.mismatch_warning')}</span>
+                </div>
+              )}
+              <AddressStep address={address} setAddress={setAddress} errors={addressErrors} clearError={clearFieldError} />
+              <div className="flex gap-3">
+                <Button variant="secondary" onClick={() => setStep(1)} className="flex-1">{t('common.back')}</Button>
+                <Button onClick={nextFromStep2} loading={submitting} className="flex-1">{t('register.complete')}</Button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <ConfirmDialog
+        open={confirmingDiscard}
+        title={t('register.discard_title')}
+        body={t('register.discard_body')}
+        confirmLabel={t('register.discard_confirm')}
+        onConfirm={() => {
+          setConfirmingDiscard(false)
+          goBackToOrigin()
+        }}
+        onCancel={() => setConfirmingDiscard(false)}
+        testId="discard-dialog"
+      />
+    <Footer maxWidth={APP_MAX_WIDTH} />
+    </div>
+  )
+}

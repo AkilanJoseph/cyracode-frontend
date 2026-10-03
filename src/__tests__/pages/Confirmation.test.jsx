@@ -1,0 +1,227 @@
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { AuthProvider } from '../../context/AuthContext'
+import { ContactWidgetProvider } from '../../context/ContactWidgetContext'
+import Confirmation from '../../pages/Confirmation'
+
+vi.mock('react-hot-toast', () => ({
+  default: { success: vi.fn(), error: vi.fn() },
+  Toaster: () => null,
+}))
+
+const mockNavigate = vi.fn()
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual('react-router-dom')
+  return { ...actual, useNavigate: () => mockNavigate }
+})
+
+const mockRecord = {
+  id: 'code-id',
+  code_name: 'MyTestCode',
+  code_type: 'traditional',
+  latitude: 12.9716,
+  longitude: 77.5946,
+  country: 'India',
+  country_code: 'IN',
+  state: 'Karnataka',
+  area: 'Indiranagar',
+  town: 'Bengaluru East',
+  road_name: '100 Feet Road',
+  city: 'Bangalore',
+  street_address: 'MG Road',
+  building_name: 'Test Building',
+  flat_number: '10A',
+  postal_code: '560001',
+}
+
+function renderWithRecord(record = mockRecord) {
+  return render(
+    <MemoryRouter
+      initialEntries={[{ pathname: '/confirmation', state: { record, mode: 'traditional' } }]}
+    >
+      <ContactWidgetProvider>
+        <AuthProvider>
+          <Routes>
+            <Route path="/confirmation" element={<Confirmation />} />
+          </Routes>
+        </AuthProvider>
+      </ContactWidgetProvider>
+    </MemoryRouter>
+  )
+}
+
+describe('Confirmation page — with record', () => {
+  it('displays the CyraCode name prominently', () => {
+    renderWithRecord()
+    expect(screen.getByText('MyTestCode')).toBeInTheDocument()
+  })
+
+  it('renders QR code canvas', () => {
+    renderWithRecord()
+    expect(document.querySelector('canvas')).toBeInTheDocument()
+  })
+
+  it('displays address in a readable format', () => {
+    renderWithRecord()
+    expect(screen.getByText(/MG Road/)).toBeInTheDocument()
+    expect(screen.getByText(/Bangalore/)).toBeInTheDocument()
+  })
+
+  it('shows latitude and longitude', () => {
+    renderWithRecord()
+    expect(screen.getByText(/12\.971/)).toBeInTheDocument()
+    expect(screen.getByText(/77\.594/)).toBeInTheDocument()
+  })
+
+  it('renders Download QR button', () => {
+    renderWithRecord()
+    expect(screen.getByRole('button', { name: /download qr/i })).toBeInTheDocument()
+  })
+
+  it('renders WhatsApp share button', () => {
+    renderWithRecord()
+    expect(screen.getByText(/whatsapp/i)).toBeInTheDocument()
+  })
+
+  it('renders Email share button', () => {
+    renderWithRecord()
+    // Role-scoped: a bare /email/i also matches the footer's queries line.
+    expect(screen.getByRole('button', { name: /email/i })).toBeInTheDocument()
+  })
+
+  it('renders Copy Link button', () => {
+    renderWithRecord()
+    expect(screen.getByText(/copy link/i)).toBeInTheDocument()
+  })
+
+  it('renders Go to Dashboard link', () => {
+    renderWithRecord()
+    // Anchored so it does not match the footer's "Dashboard" link.
+    expect(screen.getByRole('link', { name: /^go to dashboard$/i })).toBeInTheDocument()
+  })
+
+  it('copy link writes to clipboard', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      writable: true,
+      configurable: true,
+    })
+    renderWithRecord()
+    await user.click(screen.getByText(/copy link/i).closest('button'))
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining('MyTestCode'))
+  })
+
+  it('copy address icon writes the full address to clipboard', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText },
+      writable: true,
+      configurable: true,
+    })
+    renderWithRecord()
+    await user.click(screen.getByRole('button', { name: /copy address/i }))
+    expect(writeText).toHaveBeenCalledWith(
+      '10A, Test Building, MG Road, 100 Feet Road, Indiranagar, Bengaluru East, Bangalore, Karnataka, 560001, India'
+    )
+  })
+
+  it('shows congratulations message', () => {
+    renderWithRecord()
+    expect(screen.getByText(/congratulations/i)).toBeInTheDocument()
+  })
+
+  it('handles null optional fields gracefully', () => {
+    const sparseRecord = {
+      ...mockRecord,
+      building_name: null,
+      flat_number: null,
+      plot_number: null,
+      landmark: null,
+      district: null,
+      state: null,
+    }
+    renderWithRecord(sparseRecord)
+    expect(screen.getByText('MyTestCode')).toBeInTheDocument()
+  })
+
+  // The address row ended in a copy button while the coords row ended in
+  // nothing, so the two rows had different column widths and the address was
+  // additionally capped at max-w-xs while coords ran full width.
+  it('gives the address and coords rows the same column template', () => {
+    renderWithRecord()
+
+    // Located via their labels rather than by matching the escaped
+    // arbitrary-value class, which is brittle to write in a selector.
+    const addressRow = screen.getByText('Address').closest('.grid')
+    const coordsRow = screen.getByText('Coords').closest('.grid')
+    expect(addressRow).not.toBeNull()
+    expect(coordsRow).not.toBeNull()
+
+    expect(addressRow.className).toBe(coordsRow.className)
+    expect(addressRow.className).toContain('items-start')
+    // Both reserve the trailing action slot, so the right edge lines up.
+    expect(addressRow.children).toHaveLength(3)
+    expect(coordsRow.children).toHaveLength(3)
+
+    // Neither value is arbitrarily capped (the footer tagline also uses
+    // max-w-xs, so this is scoped to the two value cells rather than the tree).
+    expect(addressRow.children[1]).not.toHaveClass('max-w-xs')
+    expect(coordsRow.children[1]).not.toHaveClass('max-w-xs')
+  })
+
+  // floor_unit and po_box are collected by AddressStep and persisted (FloorUnit,
+  // DigiPin), and are in the API response, but were missing from the address
+  // line shown here.
+  it('shows the floor unit and PO box that were registered', () => {
+    renderWithRecord({ ...mockRecord, floor_unit: '3rd Floor', po_box: 'DGP' })
+
+    const address = screen.getByText(/MG Road/)
+    expect(address).toHaveTextContent('3rd Floor')
+    expect(address).toHaveTextContent('DGP')
+  })
+
+  it('omits floor and PO box when they were not provided', () => {
+    renderWithRecord({ ...mockRecord, floor_unit: null, po_box: null })
+
+    const address = screen.getByText(/MG Road/)
+    expect(address).not.toHaveTextContent('null')
+    expect(address).not.toHaveTextContent('undefined')
+  })
+})
+
+describe('Confirmation page — without record', () => {
+  it('shows fallback message when no state', () => {
+    render(
+      <MemoryRouter initialEntries={['/confirmation']}>
+        <ContactWidgetProvider>
+          <AuthProvider>
+            <Routes>
+              <Route path="/confirmation" element={<Confirmation />} />
+            </Routes>
+          </AuthProvider>
+        </ContactWidgetProvider>
+      </MemoryRouter>
+    )
+    expect(screen.getByText(/no registration data/i)).toBeInTheDocument()
+  })
+
+  it('shows Go Home button when no record', () => {
+    render(
+      <MemoryRouter initialEntries={['/confirmation']}>
+        <ContactWidgetProvider>
+          <AuthProvider>
+            <Routes>
+              <Route path="/confirmation" element={<Confirmation />} />
+            </Routes>
+          </AuthProvider>
+        </ContactWidgetProvider>
+      </MemoryRouter>
+    )
+    expect(screen.getByRole('button', { name: /go home/i })).toBeInTheDocument()
+  })
+})

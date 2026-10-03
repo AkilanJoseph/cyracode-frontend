@@ -1,0 +1,44 @@
+import plugin from 'tailwindcss/plugin'
+
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    './index.html',
+    './src/**/*.{js,jsx,ts,tsx}',
+  ],
+  theme: {
+    extend: {
+      colors: {
+        primary: '#069494',
+        'primary-dark': '#047878',
+        'primary-light': '#E0F4F4',
+        surface: '#FAFAFA',
+        ink: '#0F172A',
+        muted: '#64748B',
+        border: '#E2E8F0',
+      },
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'monospace'],
+      },
+      boxShadow: {
+        card: '0 1px 3px 0 rgb(0 0 0 / 0.07), 0 1px 2px -1px rgb(0 0 0 / 0.07)',
+        'card-hover': '0 4px 12px 0 rgb(0 0 0 / 0.1)',
+        modal: '0 20px 60px -10px rgb(0 0 0 / 0.25)',
+      },
+      borderRadius: {
+        xl: '0.75rem',
+        '2xl': '1rem',
+        '3xl': '1.5rem',
+      },
+    },
+  },
+  plugins: [
+    // v3 emits plain `hover:` unconditionally, so on a touch screen a tap sticks
+    // the hover state open. `hoverable:` only applies where a real pointer can
+    // actually hover, which is what reveal-on-hover affordances need.
+    plugin(({ addVariant }) => {
+      addVariant('hoverable', '@media (hover: hover) and (pointer: fine)')
+    }),
+  ],
+}
